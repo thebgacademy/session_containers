@@ -1,0 +1,141 @@
+
+name: Build and publish container images
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.images.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Discover images and detect changes
+        id: images
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # Find every directory containing a Dockerfile.
+          mapfile -t dockerfiles < <(
+            find . -name Dockerfile \
+              -not -path './.git/*' \
+              -not -path './.github/*' \
+              | sort
+          )
+
+          changed_dirs=()
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            # Manual run: rebuild every image.
+            changed_dirs=("${dockerfiles[@]}")
+          else
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              base="$PR_BASE_SHA"
+            else
+              base="$BEFORE_SHA"
+            fi
+
+            # Fall back to all images for a new branch/initial commit.
+            if [[ -z "$base" ||
+                  "$base" =~ ^0+$ ||
+                  ! $(git cat-file -t "$base" 2>/dev/null || true) == commit ]]; then
+              changed_dirs=("${dockerfiles[@]}")
+            else
+              mapfile -t changed_files < <(
+                git diff --name-only "$base" "$HEAD_SHA"
+              )
+
+              for file in "${changed_files[@]}"; do
+                dir=$(dirname "$file")
+
+                # Find the nearest Dockerfile ancestor.
+                while [[ "$dir" != "." ]]; do
+                  if [[ -f "$dir/Dockerfile" ]]; then
+                    changed_dirs+=("$dir/Dockerfile")
+                    break
+                  fi
+                  dir=$(dirname "$dir")
+                done
+
+                # A root-level Dockerfile is also an image.
+                if [[ "$file" == "Dockerfile" ]]; then
+                  changed_dirs+=("Dockerfile")
+                fi
+              done
+            fi
+          fi
+
+          # Keep only Dockerfiles that still exist; deduplicate.
+          images=$(
+            printf '%s\n' "${changed_dirs[@]}" |
+            sort -u |
+            while IFS= read -r dockerfile; do
+              [[ -f "$dockerfile" ]] || continue
+              dir=$(dirname "$dockerfile")
+              if [[ "$dir" == "." ]]; then
+                name="${GITHUB_REPOSITORY##*/}"
+              else
+                name="${dir##*/}"
+              fi
+              jq -cn --arg context "$dir" --arg name "$name" '{context: $context, name: $name}'
+            done |
+            jq -sc .
+          )
+
+          echo "Images to build: $images"
+          echo "matrix={\"include\":$images}" >> "$GITHUB_OUTPUT"
+
+  build:
+    permissions:
+      contents: read
+      packages: write
+    needs: discover
+    if: needs.discover.outputs.matrix != '{"include":[]}'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix).include }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.context }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
