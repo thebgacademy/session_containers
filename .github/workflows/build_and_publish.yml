@@ -112,7 +112,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.discover.outputs.matrix).include }}
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
